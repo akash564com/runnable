@@ -1,19 +1,3 @@
-
-"""
-app.py - Full integrated app for MultiGames (Phases 1-5)
-
-Features:
-- Firebase Authentication verification for Google sign-in (frontend uses Firebase Web SDK)
-- Email/password signup/login (local hashed passwords)
-- Admin panel (admin emails configured via ADMIN_EMAILS)
-- Safe ZIP upload & extraction to static/games/<slug>
-- Publish / Draft workflow
-- Embedded iframe play route with CSP
-- Stripe Checkout for premium upgrades (demo mode)
-- OpenAI-based support endpoint
-- SQLite via SQLAlchemy
-"""
-
 import os
 import io
 import zipfile
