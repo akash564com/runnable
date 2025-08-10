@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: gamezone
+    env: python
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.8
+      - key: FIREBASE_CREDENTIALS
+        sync: false   # Add in Render dashboard (JSON content of service account)
+      - key: ADMIN_EMAILS
+        value: "your-admin-email@gmail.com"
+      - key: FLASK_ENV
+        value: production
