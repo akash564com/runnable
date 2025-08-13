@@ -1,629 +1,501 @@
-import os
-import io
-import zipfile
-import shutil
-from datetime import datetime
-from functools import wraps
-from pathlib import Path
-
-from flask import (
-    Flask, render_template, request, redirect, url_for, flash, session,
-    jsonify, send_from_directory, abort, make_response
-)
-from werkzeug.utils import secure_filename
-from werkzeug.security import generate_password_hash, check_password_hash
-from flask_sqlalchemy import SQLAlchemy
-
-# Optional: load .env in dev
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
-# External services
+# app.py - Main Flask Application
+from flask import Flask, request, jsonify, render_template, session, redirect, url_for
+from flask_cors import CORS
 import firebase_admin
-from firebase_admin import credentials, auth as firebase_auth
-import openai
+from firebase_admin import credentials, auth, firestore, storage
+import os
+import json
+from datetime import datetime
 import stripe
+import openai
+from functools import wraps
 
-# -------------------------
-# Configuration
-# -------------------------
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_FOLDER = BASE_DIR / "static"
-GAMES_FOLDER = STATIC_FOLDER / "games"
-UPLOAD_TMP = BASE_DIR / "tmp_uploads"
+# Initialize Flask app
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-here')
 
-os.makedirs(GAMES_FOLDER, exist_ok=True)
-os.makedirs(UPLOAD_TMP, exist_ok=True)
+# Enable CORS for frontend integration
+CORS(app, origins=['*'])
 
-app = Flask(__name__, static_folder=str(STATIC_FOLDER), template_folder=str(BASE_DIR / "templates"))
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
-app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL", f"sqlite:///{BASE_DIR / 'game_zone.db'}")
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH", 100 * 1024 * 1024))  # 100MB default
+# Configure Stripe (use environment variables in production)
+stripe.api_key = os.environ.get('STRIPE_SECRET_KEY')
 
-# Admin emails (comma separated)
-ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
+# Configure OpenAI for AI support
+openai.api_key = os.environ.get('OPENAI_API_KEY')
 
-# Allowed extensions inside uploaded zip
-ALLOWED_ASSET_EXTS = {'.html', '.htm', '.js', '.mjs', '.css', '.json', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.wasm'}
-
-# Stripe & OpenAI config
-STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
-STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY")
-STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")  # optional, use if you created a price on Stripe
-openai_key = os.environ.get("OPENAI_API_KEY")
-
-if STRIPE_SECRET_KEY:
-    stripe.api_key = STRIPE_SECRET_KEY
-
-if openai_key:
-    openai.api_key = openai_key
-
-# -------------------------
-# Firebase Admin init
-# -------------------------
-FIREBASE_SA_PATH = os.environ.get("FIREBASE_SA_PATH", str(BASE_DIR / "firebase_service_account.json"))
-if not firebase_admin._apps:
-    if not Path(FIREBASE_SA_PATH).exists():
-        app.logger.warning("Firebase service account not found at %s — firebase verification will fail.", FIREBASE_SA_PATH)
-    else:
-        cred = credentials.Certificate(FIREBASE_SA_PATH)
-        firebase_admin.initialize_app(cred)
-
-# -------------------------
-# DB (SQLAlchemy)
-# -------------------------
-db = SQLAlchemy(app)
-
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(160), nullable=False)
-    email = db.Column(db.String(240), unique=True, nullable=False)
-    password_hash = db.Column(db.String(300))
-    firebase_uid = db.Column(db.String(300), unique=True)
-    is_admin = db.Column(db.Boolean, default=False)
-    is_premium = db.Column(db.Boolean, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-class Game(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(240), nullable=False)
-    slug = db.Column(db.String(200), unique=True, nullable=False)
-    description = db.Column(db.Text)
-    is_premium = db.Column(db.Boolean, default=False)
-    status = db.Column(db.String(30), default="draft")  # draft / published
-    upload_path = db.Column(db.String(400))  # relative path under static/games/<slug>/
-    thumbnail = db.Column(db.String(300))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-class AdminLog(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    admin_email = db.Column(db.String(240))
-    action = db.Column(db.String(500))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-with app.app_context():
-    db.create_all()
-
-# -------------------------
-# Helpers
-# -------------------------
-def login_user_session(user: User):
-    session['user_id'] = user.id
-    session['email'] = user.email
-    session['is_admin'] = bool(user.is_admin)
-    session.modified = True
-
-def logout_session():
-    session.clear()
-
-def current_user():
-    uid = session.get('user_id')
-    if not uid:
-        return None
-    return User.query.get(uid)
-
-def admin_required(fn):
-    @wraps(fn)
-    def wrapper(*a, **kw):
-        u = current_user()
-        if not u or not u.is_admin:
-            flash("Admin access required", "warning")
-            return redirect(url_for("index"))
-        return fn(*a, **kw)
-    return wrapper
-
-def is_safe_path(base_dir: Path, target: Path):
+# Initialize Firebase Admin SDK
+def initialize_firebase():
     try:
-        base = base_dir.resolve()
-        target_resolved = target.resolve()
-        return str(target_resolved).startswith(str(base))
-    except Exception:
-        return False
+        # In production, use service account key from environment
+        if not firebase_admin._apps:
+            # For development - replace with your Firebase config
+            firebase_config = {
+                "type": "service_account",
+                "project_id": os.environ.get('FIREBASE_PROJECT_ID'),
+                "private_key_id": os.environ.get('FIREBASE_PRIVATE_KEY_ID'),
+                "private_key": os.environ.get('FIREBASE_PRIVATE_KEY', '').replace('\\n', '\n'),
+                "client_email": os.environ.get('FIREBASE_CLIENT_EMAIL'),
+                "client_id": os.environ.get('FIREBASE_CLIENT_ID'),
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+            
+            cred = credentials.Certificate(firebase_config)
+            firebase_admin.initialize_app(cred, {
+                'storageBucket': os.environ.get('FIREBASE_STORAGE_BUCKET')
+            })
+        
+        print("✅ Firebase initialized successfully")
+    except Exception as e:
+        print(f"❌ Firebase initialization error: {e}")
 
-def secure_extract_zip(zip_path: Path, dest_dir: Path):
-    """
-    Validates that zip contains only allowed asset extensions and no path traversal,
-    then extracts to dest_dir.
-    """
-    with zipfile.ZipFile(str(zip_path), 'r') as z:
-        for info in z.infolist():
-            # skip directories
-            if info.is_dir():
-                continue
-            # normalize name
-            filename = info.filename
-            # Prevent absolute paths
-            if os.path.isabs(filename):
-                raise ValueError("Absolute paths are not allowed in ZIP")
-            # Prevent path traversal
-            normalized = os.path.normpath(filename)
-            if normalized.startswith(".."):
-                raise ValueError("Path traversal detected in ZIP")
-            _, ext = os.path.splitext(filename.lower())
-            # allow files without extension? usually index.html has extension
-            if ext and ext not in ALLOWED_ASSET_EXTS:
-                raise ValueError(f"Forbidden file type in zip: {ext}")
-        # all checks passed -> extract
-        z.extractall(str(dest_dir))
+initialize_firebase()
 
-def log_admin_action(admin_email: str, action: str):
-    entry = AdminLog(admin_email=admin_email, action=action)
-    db.session.add(entry)
-    db.session.commit()
+# Get Firestore database instance
+db = firestore.client()
 
-def verify_firebase_token(id_token: str):
-    """Returns decoded token dict or raises exception."""
-    if not id_token:
-        raise ValueError("Missing Firebase token")
-    # firebase_admin must be initialized
-    if not firebase_admin._apps:
-        raise RuntimeError("Firebase Admin SDK not initialized on server")
-    decoded = firebase_auth.verify_id_token(id_token)
-    return decoded
-
-def get_logged_in_email_from_cookie():
-    """Frontend should store idToken in cookie 'firebase_token' after login; fallback uses session."""
-    id_token = request.cookies.get("firebase_token")
-    if id_token:
+# Authentication decorator
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Verify Firebase ID token
+        id_token = request.headers.get('Authorization')
+        if not id_token:
+            return jsonify({'error': 'No token provided'}), 401
+        
         try:
-            decoded = verify_firebase_token(id_token)
-            return decoded.get("email")
-        except Exception:
-            return None
-    # fallback to session
-    return session.get("email")
+            # Remove 'Bearer ' prefix if present
+            if id_token.startswith('Bearer '):
+                id_token = id_token[7:]
+            
+            decoded_token = auth.verify_id_token(id_token)
+            request.user = decoded_token
+            return f(*args, **kwargs)
+        except Exception as e:
+            return jsonify({'error': 'Invalid token'}), 401
+    
+    return decorated_function
 
-# -------------------------
-# Routes - Auth & Home
-# -------------------------
-@app.route("/")
+# Admin authentication decorator
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        id_token = request.headers.get('Authorization')
+        if not id_token:
+            return jsonify({'error': 'No token provided'}), 401
+        
+        try:
+            if id_token.startswith('Bearer '):
+                id_token = id_token[7:]
+            
+            decoded_token = auth.verify_id_token(id_token)
+            user_id = decoded_token['uid']
+            
+            # Check if user is admin
+            user_doc = db.collection('users').document(user_id).get()
+            if not user_doc.exists or not user_doc.to_dict().get('is_admin', False):
+                return jsonify({'error': 'Admin access required'}), 403
+            
+            request.user = decoded_token
+            return f(*args, **kwargs)
+        except Exception as e:
+            return jsonify({'error': 'Invalid token or insufficient permissions'}), 401
+    
+    return decorated_function
+
+# Routes
+
+@app.route('/')
 def index():
-    user = current_user()
-    games = Game.query.filter_by(status="published").all()
-    return render_template("index.html", user=user, games=games, stripe_pub_key=STRIPE_PUBLISHABLE_KEY)
+    """Serve the main HTML page"""
+    return render_template('index.html')
 
-@app.route("/signup", methods=["POST"])
-def signup():
-    username = request.form.get("username", "").strip() or "Player"
-    email = request.form.get("email", "").strip().lower()
-    password = request.form.get("password", "")
-    if not email or not password:
-        flash("Email and password required", "error")
-        return redirect(url_for("index"))
-    if User.query.filter_by(email=email).first():
-        flash("Email already registered", "error")
-        return redirect(url_for("index"))
-    pw_hash = generate_password_hash(password)
-    is_admin = email in ADMIN_EMAILS
-    user = User(username=username, email=email, password_hash=pw_hash, is_admin=is_admin)
-    db.session.add(user)
-    db.session.commit()
-    login_user_session(user)
-    flash("Account created and logged in", "success")
-    return redirect(url_for("index"))
+# Authentication Routes
 
-@app.route("/login", methods=["POST"])
-def login():
-    email = request.form.get("email", "").strip().lower()
-    password = request.form.get("password", "")
-    user = User.query.filter_by(email=email).first()
-    if user and user.password_hash and check_password_hash(user.password_hash, password):
-        login_user_session(user)
-        flash("Logged in", "success")
-        return redirect(url_for("index"))
-    flash("Invalid credentials", "error")
-    return redirect(url_for("index"))
-
-@app.route("/firebase_login", methods=["POST"])
-def firebase_login():
-    """
-    Expects JSON { "idToken": "<firebase id token>" }
-    Verifies token server-side, creates or updates local user record, and creates session.
-    """
-    payload = request.get_json() or {}
-    id_token = payload.get("idToken")
-    if not id_token:
-        return jsonify({"error": "Missing idToken"}), 400
+@app.route('/api/auth/verify', methods=['POST'])
+def verify_token():
+    """Verify Firebase ID token and return user info"""
     try:
-        decoded = verify_firebase_token(id_token)
+        data = request.get_json()
+        id_token = data.get('idToken')
+        
+        decoded_token = auth.verify_id_token(id_token)
+        user_id = decoded_token['uid']
+        
+        # Get or create user profile in Firestore
+        user_ref = db.collection('users').document(user_id)
+        user_doc = user_ref.get()
+        
+        if not user_doc.exists:
+            # Create new user profile
+            user_data = {
+                'uid': user_id,
+                'email': decoded_token.get('email'),
+                'name': decoded_token.get('name', ''),
+                'is_premium': False,
+                'is_admin': False,
+                'created_at': datetime.utcnow(),
+                'games_played': [],
+                'subscription_status': 'free'
+            }
+            user_ref.set(user_data)
+        else:
+            user_data = user_doc.to_dict()
+        
+        return jsonify({
+            'success': True,
+            'user': user_data
+        })
+    
     except Exception as e:
-        return jsonify({"error": f"Token verify failed: {e}"}), 400
+        return jsonify({'error': str(e)}), 400
 
-    email = decoded.get("email")
-    name = decoded.get("name") or (email.split("@")[0] if email else "Player")
-    uid = decoded.get("uid")
+# Games Routes
 
-    if not email:
-        return jsonify({"error": "Token has no email"}), 400
-
-    user = User.query.filter_by(email=email).first()
-    if not user:
-        user = User(username=name, email=email, firebase_uid=uid, is_admin=(email in ADMIN_EMAILS))
-        db.session.add(user)
-        db.session.commit()
-    else:
-        # attach firebase uid if missing
-        if not user.firebase_uid:
-            user.firebase_uid = uid
-            db.session.commit()
-
-    # log user in (create server session)
-    login_user_session(user)
-
-    # Return where frontend should redirect
-    redirect_to = "/admin" if user.is_admin else "/"
-    return jsonify({"redirect": redirect_to})
-
-@app.route("/logout")
-def logout():
-    logout_session()
-    # Also clear firebase_token cookie on client; server can't remove client cookie reliably here,
-    # but we give a minimal response.
-    resp = redirect(url_for("index"))
-    resp.set_cookie("firebase_token", "", expires=0)
-    return resp
-
-# Password reset (test-mode)
-@app.route("/forgot_password", methods=["POST"])
-def forgot_password():
-    email = request.form.get("email", "").strip().lower()
-    if not email:
-        flash("Email required", "error")
-        return redirect(url_for("index"))
-    user = User.query.filter_by(email=email).first()
-    if not user:
-        flash("If the email exists, a reset was sent (test mode)", "info")
-        return redirect(url_for("index"))
-    reset_link = f"{request.url_root}reset_password/{user.id}"
-    # In production you would send this by email; here we print it for demo/test.
-    app.logger.info("[TEST MODE] Password reset link for %s: %s", email, reset_link)
-    flash("Password reset link generated (check server logs in test mode).", "info")
-    return redirect(url_for("index"))
-
-@app.route("/reset_password/<int:user_id>", methods=["GET", "POST"])
-def reset_password(user_id):
-    user = User.query.get_or_404(user_id)
-    if request.method == "POST":
-        new_pw = request.form.get("password", "")
-        if not new_pw:
-            flash("Password required", "error")
-            return redirect(request.url)
-        user.password_hash = generate_password_hash(new_pw)
-        db.session.commit()
-        flash("Password updated; please log in.", "success")
-        return redirect(url_for("index"))
-    return render_template("reset_password.html", user=user)
-
-# -------------------------
-# Admin routes - Games & Users
-# -------------------------
-@app.route("/admin")
-@admin_required
-def admin_dashboard():
-    user = current_user()
-    games = Game.query.order_by(Game.created_at.desc()).all()
-    logs = AdminLog.query.order_by(AdminLog.created_at.desc()).limit(40).all()
-    return render_template("admin_panel.html", user=user, games=games, logs=logs)
-
-@app.route("/admin/upload", methods=["POST"])
-@admin_required
-def admin_upload():
-    user = current_user()
-    title = request.form.get("title", "").strip()
-    slug_raw = request.form.get("slug", "").strip()
-    slug = secure_filename(slug_raw) if slug_raw else secure_filename(title.lower().replace(" ", "-"))
-    description = request.form.get("description", "")
-    is_premium = bool(request.form.get("is_premium"))
-    publish_now = bool(request.form.get("publish_now"))
-
-    file = request.files.get("zipfile")
-    if not file:
-        flash("No file uploaded", "error")
-        return redirect(url_for("admin_dashboard"))
-
-    if not file.filename.lower().endswith(".zip"):
-        flash("Only .zip files are accepted", "error")
-        return redirect(url_for("admin_dashboard"))
-
-    # save temp zip
-    ts = int(datetime.utcnow().timestamp())
-    tmp_name = f"{ts}_{secure_filename(file.filename)}"
-    tmp_path = UPLOAD_TMP / tmp_name
-    file.save(str(tmp_path))
-
-    # destination folder for extracted game
-    dest_dir = GAMES_FOLDER / slug
-    if dest_dir.exists():
-        shutil.rmtree(dest_dir)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    # validate & extract
+@app.route('/api/games', methods=['GET'])
+def get_games():
+    """Get all games with optional filtering"""
     try:
-        secure_extract_zip(tmp_path, dest_dir)
+        games_ref = db.collection('games')
+        
+        # Filter by category if provided
+        category = request.args.get('category')
+        if category:
+            games_ref = games_ref.where('category', '==', category)
+        
+        # Filter by platform if provided
+        platform = request.args.get('platform')
+        if platform:
+            games_ref = games_ref.where('platforms', 'array_contains', platform)
+        
+        games = []
+        for doc in games_ref.stream():
+            game_data = doc.to_dict()
+            game_data['id'] = doc.id
+            games.append(game_data)
+        
+        return jsonify({'games': games})
+    
     except Exception as e:
-        # cleanup
-        shutil.rmtree(dest_dir, ignore_errors=True)
-        tmp_path.unlink(missing_ok=True)
-        flash(f"Upload failed: {e}", "error")
-        return redirect(url_for("admin_dashboard"))
+        return jsonify({'error': str(e)}), 500
 
-    # remove tmp zip
-    tmp_path.unlink(missing_ok=True)
-
-    # create or update DB record
-    g = Game.query.filter_by(slug=slug).first()
-    if not g:
-        g = Game(title=title or slug, slug=slug, description=description, is_premium=is_premium)
-    else:
-        g.title = title or g.title
-        g.description = description
-        g.is_premium = is_premium
-
-    g.upload_path = f"games/{slug}"
-    g.status = "published" if publish_now else "draft"
-    db.session.add(g)
-    db.session.commit()
-
-    log_admin_action(user.email, f"Uploaded game '{g.title}' slug={g.slug} status={g.status}")
-    flash("Game uploaded successfully", "success")
-    return redirect(url_for("admin_dashboard"))
-
-@app.route("/admin/publish/<int:game_id>", methods=["POST"])
-@admin_required
-def admin_publish(game_id):
-    user = current_user()
-    g = Game.query.get_or_404(game_id)
-    g.status = "published"
-    db.session.commit()
-    log_admin_action(user.email, f"Published game '{g.title}'")
-    flash("Game published", "success")
-    return redirect(url_for("admin_dashboard"))
-
-@app.route("/admin/delete/<int:game_id>", methods=["POST"])
-@admin_required
-def admin_delete(game_id):
-    user = current_user()
-    g = Game.query.get_or_404(game_id)
-    # remove files
-    folder = GAMES_FOLDER / g.slug
+@app.route('/api/games/<game_id>', methods=['GET'])
+def get_game(game_id):
+    """Get specific game details"""
     try:
-        if folder.exists():
-            shutil.rmtree(folder)
-    except Exception:
-        app.logger.exception("Failed to delete game folder")
-    db.session.delete(g)
-    db.session.commit()
-    log_admin_action(user.email, f"Deleted game '{g.title}'")
-    flash("Game deleted", "info")
-    return redirect(url_for("admin_dashboard"))
+        game_doc = db.collection('games').document(game_id).get()
+        if not game_doc.exists:
+            return jsonify({'error': 'Game not found'}), 404
+        
+        game_data = game_doc.to_dict()
+        game_data['id'] = game_doc.id
+        
+        return jsonify({'game': game_data})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-@app.route("/admin/users")
+@app.route('/api/games', methods=['POST'])
 @admin_required
-def admin_users():
-    user = current_user()
-    users = User.query.order_by(User.created_at.desc()).all()
-    logs = AdminLog.query.order_by(AdminLog.created_at.desc()).limit(40).all()
-    return render_template("admin_users.html", user=user, users=users, logs=logs)
-
-@app.route("/admin/users/<int:user_id>/toggle_premium", methods=["POST"])
-@admin_required
-def admin_toggle_premium(user_id):
-    admin = current_user()
-    target = User.query.get_or_404(user_id)
-    target.is_premium = not target.is_premium
-    db.session.commit()
-    log_admin_action(admin.email, f"Toggled premium for {target.email} -> {target.is_premium}")
-    flash("User premium status updated.", "success")
-    return redirect(url_for("admin_users"))
-
-@app.route("/admin/users/<int:user_id>/delete", methods=["POST"])
-@admin_required
-def admin_delete_user(user_id):
-    admin = current_user()
-    target = User.query.get_or_404(user_id)
-    db.session.delete(target)
-    db.session.commit()
-    log_admin_action(admin.email, f"Deleted user {target.email}")
-    flash("User deleted.", "info")
-    return redirect(url_for("admin_users"))
-
-# -------------------------
-# Serve game assets safely
-# -------------------------
-@app.route("/games_assets/<game_slug>/<path:filename>")
-def serve_game_asset(game_slug, filename):
-    # sanitize slug and prevent traversal
-    safe_slug = secure_filename(game_slug)
-    folder = GAMES_FOLDER / safe_slug
-    if not folder.exists():
-        return abort(404)
-    # normalize path
-    normalized = os.path.normpath(filename)
-    if normalized.startswith(".."):
-        return abort(404)
-    full_path = folder / normalized
-    if not is_safe_path(GAMES_FOLDER, full_path):
-        return abort(404)
-    if not full_path.exists():
-        return abort(404)
-    return send_from_directory(str(folder), str(normalized))
-
-# Play embed page with CSP
-@app.route("/game/<slug>/play")
-def play_game(slug):
-    g = Game.query.filter_by(slug=slug, status="published").first_or_404()
-    folder = GAMES_FOLDER / g.slug
-    index_file = None
-    for name in ("index.html", "index.htm"):
-        if (folder / name).exists():
-            index_file = name
-            break
-    if not index_file:
-        abort(404)
-    play_url = url_for("serve_game_asset", game_slug=g.slug, filename=index_file)
-    resp = make_response(render_template("play_embed.html", game=g, play_url=play_url))
-    # CSP header to restrict where content can load from (may need relaxation depending on games)
-    resp.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;"
-    return resp
-
-# -------------------------
-# Stripe / Premium upgrade
-# -------------------------
-@app.route("/upgrade")
-def upgrade():
-    email = get_logged_in_email_from_cookie() or session.get("email")
-    if not email:
-        flash("Please log in to upgrade", "warning")
-        return redirect(url_for("index"))
-    return render_template("premium.html", stripe_pub_key=STRIPE_PUBLISHABLE_KEY)
-
-@app.route("/create-checkout-session", methods=["POST"])
-def create_checkout_session():
-    email = get_logged_in_email_from_cookie() or session.get("email")
-    if not email:
-        return jsonify({"error": "Not logged in"}), 403
-
-    # If user has a Stripe Price defined by env, use it; else create inline price_data
-    if STRIPE_PRICE_ID:
-        line_items = [{"price": STRIPE_PRICE_ID, "quantity": 1}]
-    else:
-        # example one-time purchase of $5.00
-        line_items = [{
-            "price_data": {
-                "currency": "usd",
-                "unit_amount": 500,
-                "product_data": {"name": "Premium Membership (One-time demo)"},
-            },
-            "quantity": 1
-        }]
-
+def add_game():
+    """Add new game (Admin only)"""
     try:
+        data = request.get_json()
+        
+        # Validate required fields
+        required_fields = ['title', 'description', 'category', 'platforms']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'error': f'Missing required field: {field}'}), 400
+        
+        game_data = {
+            'title': data['title'],
+            'description': data['description'],
+            'category': data['category'],
+            'platforms': data['platforms'],
+            'tags': data.get('tags', []),
+            'is_premium': data.get('is_premium', False),
+            'rating': data.get('rating', 0),
+            'image_url': data.get('image_url', ''),
+            'created_at': datetime.utcnow(),
+            'created_by': request.user['uid'],
+            'status': 'pending_approval'
+        }
+        
+        # Add game to Firestore
+        game_ref = db.collection('games').add(game_data)
+        
+        return jsonify({
+            'success': True,
+            'game_id': game_ref[1].id,
+            'message': 'Game added successfully'
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Premium Routes
+
+@app.route('/api/premium/upgrade', methods=['POST'])
+@login_required
+def upgrade_premium():
+    """Handle premium upgrade with Stripe"""
+    try:
+        data = request.get_json()
+        user_id = request.user['uid']
+        
+        # Create Stripe checkout session
         checkout_session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            line_items=line_items,
-            mode="payment",
-            success_url=url_for("payment_success", _external=True) + "?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url=url_for("payment_cancel", _external=True),
-            customer_email=email  # prefill email
+            payment_method_types=['card'],
+            line_items=[{
+                'price_data': {
+                    'currency': 'usd',
+                    'unit_amount': 999,  # $9.99 in cents
+                    'product_data': {
+                        'name': 'GameVerse Premium Membership',
+                        'description': 'Monthly premium gaming subscription'
+                    },
+                    'recurring': {
+                        'interval': 'month'
+                    }
+                },
+                'quantity': 1,
+            }],
+            mode='subscription',
+            success_url=f"{request.host_url}premium/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{request.host_url}premium/cancel",
+            client_reference_id=user_id
         )
+        
+        return jsonify({
+            'success': True,
+            'checkout_url': checkout_session.url
+        })
+    
     except Exception as e:
-        app.logger.exception("Stripe session create failed")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
-    return jsonify({"id": checkout_session.id})
-
-@app.route("/payment-success")
-def payment_success():
-    email = get_logged_in_email_from_cookie() or session.get("email")
-    if email:
-        # mark local user premium
-        user = User.query.filter_by(email=email).first()
-        if user:
-            user.is_premium = True
-            db.session.commit()
-    return render_template("success.html")
-
-@app.route("/payment-cancel")
-def payment_cancel():
-    return render_template("cancel.html")
-
-# -------------------------
-# Support (OpenAI)
-# -------------------------
-@app.route("/support")
-def support():
-    # optionally require login: add decorator
-    return render_template("support.html")
-
-@app.route("/api/support", methods=["POST"])
-def api_support():
-    if not openai_key:
-        return jsonify({"error": "AI support not configured"}), 500
-    data = request.get_json() or {}
-    user_message = (data.get("message") or "").strip()
-    if not user_message:
-        return jsonify({"error": "No message provided"}), 400
-
-    system_prompt = (
-        "You are GameZone Support Bot. Be concise, helpful, and polite. "
-        "Give step-by-step troubleshooting for technical issues with HTML5 games, account management, and payments. "
-        "If the user asks for confidential actions, instruct them to use the site or contact admin. "
-    )
-
+@app.route('/api/premium/webhook', methods=['POST'])
+def stripe_webhook():
+    """Handle Stripe webhooks for payment confirmation"""
     try:
-        # Use chat completion with gpt-3.5-turbo as a stable default
-        resp = openai.ChatCompletion.create(
+        payload = request.get_data()
+        sig_header = request.headers.get('Stripe-Signature')
+        endpoint_secret = os.environ.get('STRIPE_ENDPOINT_SECRET')
+        
+        event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
+        
+        if event['type'] == 'checkout.session.completed':
+            session = event['data']['object']
+            user_id = session['client_reference_id']
+            
+            # Update user to premium status
+            user_ref = db.collection('users').document(user_id)
+            user_ref.update({
+                'is_premium': True,
+                'subscription_status': 'active',
+                'upgraded_at': datetime.utcnow()
+            })
+            
+            print(f"✅ User {user_id} upgraded to premium")
+        
+        return jsonify({'success': True})
+    
+    except Exception as e:
+        print(f"❌ Webhook error: {e}")
+        return jsonify({'error': str(e)}), 400
+
+# Admin Routes
+
+@app.route('/api/admin/users', methods=['GET'])
+@admin_required
+def get_users():
+    """Get all users (Admin only)"""
+    try:
+        users = []
+        for doc in db.collection('users').stream():
+            user_data = doc.to_dict()
+            user_data['id'] = doc.id
+            users.append(user_data)
+        
+        return jsonify({'users': users})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/users/<user_id>/premium', methods=['POST'])
+@admin_required
+def grant_premium(user_id):
+    """Grant premium status to user (Admin only)"""
+    try:
+        user_ref = db.collection('users').document(user_id)
+        user_ref.update({
+            'is_premium': True,
+            'subscription_status': 'admin_granted',
+            'upgraded_at': datetime.utcnow()
+        })
+        
+        return jsonify({
+            'success': True,
+            'message': 'Premium status granted'
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/games/approve/<game_id>', methods=['POST'])
+@admin_required
+def approve_game(game_id):
+    """Approve pending game (Admin only)"""
+    try:
+        game_ref = db.collection('games').document(game_id)
+        game_ref.update({
+            'status': 'approved',
+            'approved_at': datetime.utcnow(),
+            'approved_by': request.user['uid']
+        })
+        
+        return jsonify({
+            'success': True,
+            'message': 'Game approved successfully'
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# AI Support Routes
+
+@app.route('/api/support/chat', methods=['POST'])
+@login_required
+def ai_chat():
+    """AI-powered chat support"""
+    try:
+        data = request.get_json()
+        user_message = data.get('message')
+        user_id = request.user['uid']
+        
+        # Create chat completion with OpenAI
+        response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": system_prompt},
+                {
+                    "role": "system",
+                    "content": """You are a helpful gaming support assistant for GameVerse. 
+                    Help users with game-related questions, account issues, and general support.
+                    Be friendly, helpful, and gaming-focused in your responses."""
+                },
                 {"role": "user", "content": user_message}
             ],
-            max_tokens=600,
-            temperature=0.2,
+            max_tokens=150,
+            temperature=0.7
         )
-        reply = resp["choices"][0]["message"]["content"].strip()
-        return jsonify({"reply": reply})
+        
+        ai_response = response.choices[0].message.content
+        
+        # Store conversation in Firestore
+        db.collection('support_chats').add({
+            'user_id': user_id,
+            'user_message': user_message,
+            'ai_response': ai_response,
+            'timestamp': datetime.utcnow()
+        })
+        
+        return jsonify({
+            'success': True,
+            'response': ai_response
+        })
+    
     except Exception as e:
-        app.logger.exception("OpenAI call failed")
-        return jsonify({"error": "AI support temporarily unavailable", "detail": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
-# -------------------------
-# Misc: play route for game_id (older style)
-# -------------------------
-@app.route("/play/<int:game_id>")
-def play_game_by_id(game_id):
-    g = Game.query.get_or_404(game_id)
-    if g.is_premium:
-        # check premium status
-        email = get_logged_in_email_from_cookie() or session.get("email")
-        if not email:
-            return "Premium only — please log in & upgrade.", 403
-        user = User.query.filter_by(email=email).first()
-        if not user or not user.is_premium:
-            return "Upgrade to premium to play this game.", 403
+@app.route('/api/support/ticket', methods=['POST'])
+@login_required
+def create_ticket():
+    """Create support ticket"""
+    try:
+        data = request.get_json()
+        user_id = request.user['uid']
+        
+        ticket_data = {
+            'user_id': user_id,
+            'subject': data.get('subject'),
+            'message': data.get('message'),
+            'priority': data.get('priority', 'medium'),
+            'status': 'open',
+            'created_at': datetime.utcnow()
+        }
+        
+        ticket_ref = db.collection('support_tickets').add(ticket_data)
+        
+        return jsonify({
+            'success': True,
+            'ticket_id': ticket_ref[1].id,
+            'message': 'Support ticket created successfully'
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-    folder = GAMES_FOLDER / g.slug
-    idx = None
-    for n in ("index.html", "index.htm"):
-        if (folder / n).exists():
-            idx = n
-            break
-    if not idx:
-        abort(404)
-    play_url = url_for("serve_game_asset", game_slug=g.slug, filename=idx)
-    resp = make_response(render_template("play_embed.html", game=g, play_url=play_url))
-    resp.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;"
-    return resp
+# Analytics Routes
 
-# -------------------------
-# Run
-# -------------------------
-if __name__ == "__main__":
-    # ensure folders exist
-    GAMES_FOLDER.mkdir(parents=True, exist_ok=True)
-    UPLOAD_TMP.mkdir(parents=True, exist_ok=True)
-    app.run(host="0.0.0.0", debug=True)
+@app.route('/api/analytics/stats', methods=['GET'])
+@admin_required
+def get_analytics():
+    """Get platform analytics (Admin only)"""
+    try:
+        # Get user stats
+        users_ref = db.collection('users')
+        total_users = len(list(users_ref.stream()))
+        premium_users = len(list(users_ref.where('is_premium', '==', True).stream()))
+        
+        # Get game stats
+        games_ref = db.collection('games')
+        total_games = len(list(games_ref.stream()))
+        premium_games = len(list(games_ref.where('is_premium', '==', True).stream()))
+        
+        # Get ticket stats
+        tickets_ref = db.collection('support_tickets')
+        open_tickets = len(list(tickets_ref.where('status', '==', 'open').stream()))
+        
+        stats = {
+            'total_users': total_users,
+            'premium_users': premium_users,
+            'total_games': total_games,
+            'premium_games': premium_games,
+            'open_tickets': open_tickets,
+            'conversion_rate': (premium_users / total_users * 100) if total_users > 0 else 0
+        }
+        
+        return jsonify({'stats': stats})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Health check route
+@app.route('/health')
+def health_check():
+    """Health check for deployment"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.utcnow().isoformat(),
+        'version': '1.0.0'
+    })
+
+# Error handlers
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    debug_mode = os.environ.get('FLASK_ENV') == 'development'
+    
+    print("🚀 Starting GameVerse Flask Backend...")
+    print(f"📊 Running on port: {port}")
+    print(f"🔧 Debug mode: {debug_mode}")
+    
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)
