@@ -1,18 +1,31 @@
 services:
   - type: web
-    name: gamezone
+    name: gameverse-backend
     env: python
-    plan: free
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.8
-      - key: FIREBASE_CREDENTIALS
-        sync: false   # Add in Render dashboard (JSON content of service account)
-      - key: ADMIN_EMAILS
-        value: "your-admin-email@gmail.com"
+        value: 3.9.7
+      - key: SECRET_KEY
+        generateValue: true
       - key: FLASK_ENV
         value: production
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY_ID
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_CLIENT_ID
+        sync: false
+      - key: FIREBASE_STORAGE_BUCKET
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_ENDPOINT_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
